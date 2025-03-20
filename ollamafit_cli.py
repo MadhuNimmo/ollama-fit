@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Ollama Model Library Scraper - Fetches model information from the Ollama website
+and checks compatibility with your system.
 """
-
 
 import requests
 from bs4 import BeautifulSoup
@@ -13,7 +13,7 @@ import sys
 import time
 import platform
 import subprocess
-import psutil  # Add this line
+import psutil
 from typing import Dict, List, Any, Optional
 
 class OllamaLibraryScraper:
@@ -22,43 +22,49 @@ class OllamaLibraryScraper:
         self.base_url = "https://ollama.com"
         self.library_url = f"{self.base_url}/library"
         self.cache_dir = cache_dir
-        
-        # Create cache directory if it doesn't exist
-        if not os.path.exists(self.cache_dir):
-            os.makedirs(self.cache_dir)
-            
-        # Initialize empty model data
         self.models = []
         
-    def scrape_library(self, use_cache=True, cache_expiry=3600):
-        """
-        Scrape the main library page to get a list of all models.
+        # Create cache directory if needed
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+    
+    def _fetch_page(self, url):
+        """Fetch HTML content from a URL with error handling."""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as e:
+            print(f"Error fetching {url}: {e}")
+            sys.exit(1)
+    
+    def _get_cached_or_fetch(self, url, cache_filename, use_cache=True, cache_expiry=3600):
+        """Get content from cache or fetch from web."""
+        cache_file = os.path.join(self.cache_dir, cache_filename)
         
-        Args:
-            use_cache: Whether to use cached results if available
-            cache_expiry: How long (in seconds) to consider cache valid
-        """
-        cache_file = os.path.join(self.cache_dir, "library.html")
-        
-        # Check if cache exists and is recent enough
         if use_cache and os.path.exists(cache_file):
             cache_age = time.time() - os.path.getmtime(cache_file)
             if cache_age < cache_expiry:
-                print(f"Using cached library page (age: {int(cache_age)}s)")
                 with open(cache_file, 'r', encoding='utf-8') as f:
-                    html = f.read()
-            else:
-                print("Cache expired, fetching fresh data...")
-                html = self._fetch_page(self.library_url)
-                with open(cache_file, 'w', encoding='utf-8') as f:
-                    f.write(html)
-        else:
-            print("Fetching library page...")
-            html = self._fetch_page(self.library_url)
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                f.write(html)
-                
-        # Parse the HTML to extract model cards
+                    return f.read()
+        
+        html = self._fetch_page(url)
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            f.write(html)
+        return html
+    
+    def scrape_library(self, use_cache=True):
+        """Scrape the main library page to get a list of all models."""
+        html = self._get_cached_or_fetch(
+            self.library_url, 
+            "library.html", 
+            use_cache
+        )
+        
+        # Parse HTML to extract model cards
         soup = BeautifulSoup(html, 'html.parser')
         model_cards = soup.select('a[href^="/library/"]')
         
@@ -70,135 +76,128 @@ class OllamaLibraryScraper:
                 
             # Get model name from URL
             model_name = card['href'].split('/')[-1]
-            
-            # Skip if this is not a model card (might be navigation, etc.)
             if not model_name or len(model_name) < 2:
                 continue
-                
-            # Extract basic information from the card
+            
+            # Extract info from card
             model_info = {
                 'name': model_name,
                 'url': f"{self.base_url}{card['href']}",
-                'description': self._extract_description(card),
-                'pull_count': self._extract_pull_count(card),
-                'last_updated': self._extract_last_updated(card),
-                'capabilities': self._extract_capabilities(card),
-                'size': self._extract_size(card)
+                'description': self._extract_text(card, 'p.max-w-lg'),
+                'pull_count': self._extract_text(card, 'span[x-test-pull-count]'),
+                'last_updated': self._extract_text(card, 'span[x-test-updated]'),
+                'capabilities': [elem.text.strip() for elem in card.select('span[x-test-capability]')],
+                'size': self._extract_text(card, 'span[x-test-size]')
             }
             
             self.models.append(model_info)
-            
+        
         print(f"Found {len(self.models)} models")
         return self.models
     
-    def _extract_description(self, card):
-        """Extract model description from card."""
-        desc_elem = card.select_one('p.max-w-lg')
-        return desc_elem.text.strip() if desc_elem else ""
+    def _extract_text(self, element, selector):
+        """Helper to extract text from an element using a selector."""
+        found = element.select_one(selector)
+        return found.text.strip() if found else ""
     
-    def _extract_pull_count(self, card):
-        """Extract pull count from card."""
-        pull_elem = card.select_one('span[x-test-pull-count]')
-        return pull_elem.text.strip() if pull_elem else "Unknown"
-    
-    def _extract_last_updated(self, card):
-        """Extract last updated date from card."""
-        updated_elem = card.select_one('span[x-test-updated]')
-        return updated_elem.text.strip() if updated_elem else "Unknown"
-    
-    def _extract_capabilities(self, card):
-        """Extract model capabilities from card."""
-        capabilities = []
-        capability_elems = card.select('span[x-test-capability]')
-        for elem in capability_elems:
-            capabilities.append(elem.text.strip())
-        return capabilities
-    
-    def _extract_size(self, card):
-        """Extract model size from card."""
-        size_elem = card.select_one('span[x-test-size]')
-        return size_elem.text.strip() if size_elem else "Unknown"
-    
-    def scrape_model_details(self, model_info, use_cache=True, cache_expiry=3600):
-        """
-        Scrape detailed information about a specific model.
-        
-        Args:
-            model_info: Basic model information from scrape_library
-            use_cache: Whether to use cached results if available
-            cache_expiry: How long (in seconds) to consider cache valid
-        """
+    def scrape_model_details(self, model_info, use_cache=True):
+        """Scrape detailed information about a specific model."""
         model_name = model_info['name']
         model_url = model_info['url']
-        cache_file = os.path.join(self.cache_dir, f"model_{model_name}.html")
         
-        # Check if cache exists and is recent enough
-        if use_cache and os.path.exists(cache_file):
-            cache_age = time.time() - os.path.getmtime(cache_file)
-            if cache_age < cache_expiry:
-                print(f"Using cached model page for {model_name} (age: {int(cache_age)}s)")
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    html = f.read()
-            else:
-                print(f"Cache expired for {model_name}, fetching fresh data...")
-                html = self._fetch_page(model_url)
-                with open(cache_file, 'w', encoding='utf-8') as f:
-                    f.write(html)
-        else:
-            print(f"Fetching details for {model_name}...")
-            html = self._fetch_page(model_url)
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                f.write(html)
-                
-        # Parse the HTML to extract detailed information
+        html = self._get_cached_or_fetch(
+            model_url,
+            f"model_{model_name}.html",
+            use_cache
+        )
+        
+        # Parse HTML to extract detailed information
         soup = BeautifulSoup(html, 'html.parser')
         
         # Extract README content
         readme = self._extract_readme(soup)
         
-        # Extract parameter count if available
-        parameter_count = self._extract_parameter_count(soup, readme)
-        
-        # Extract context window if available
-        context_window = self._extract_context_window(soup, readme)
-        
         # Update model_info with details
         model_info.update({
             'readme': readme,
-            'parameter_count': parameter_count,
-            'context_window': context_window
+            'parameter_count': self._extract_parameter_count(soup, readme),
+            'context_window': self._extract_context_window(soup, readme)
         })
         
         # Scrape tags for this model
-        self.scrape_model_tags(model_info, use_cache, cache_expiry)
+        self.scrape_model_tags(model_info, use_cache)
         
         return model_info
     
-    def scrape_model_tags(self, model_info, use_cache=True, cache_expiry=3600):
+    def _extract_readme(self, soup):
+        """Extract README content from model page."""
+        readme_header = soup.find('h2', string='Readme')
+        if not readme_header:
+            return ""
+            
+        textarea = readme_header.find_next('textarea')
+        if textarea:
+            return textarea.text.strip()
+            
+        return ""
+    
+    def _extract_parameter_count(self, soup, readme):
+        """Extract parameter count from model page or README."""
+        # First check the model specs on the page
+        param_elem = soup.select_one('dt:-soup-contains("Parameters") + dd')
+        if param_elem:
+            return param_elem.text.strip()
+            
+        # Otherwise, try to find it in the README
+        if readme:
+            param_patterns = [
+                r'(\d+(?:\.\d+)?)\s*[Bb]illion parameters',
+                r'(\d+(?:\.\d+)?)\s*[Bb] parameters',
+                r'(\d+(?:\.\d+)?)[Bb] parameter',
+                r'parameters:\s*(\d+(?:\.\d+)?)\s*[Bb]'
+            ]
+            
+            for pattern in param_patterns:
+                match = re.search(pattern, readme)
+                if match:
+                    return f"{match.group(1)}B"
+                    
+        return None
+    
+    def _extract_context_window(self, soup, readme):
+        """Extract context window size from model page or README."""
+        # First check the model specs on the page
+        context_elem = soup.select_one('dt:-soup-contains("Context") + dd')
+        if context_elem:
+            return context_elem.text.strip()
+            
+        # Otherwise, try to find it in the README
+        if readme:
+            context_patterns = [
+                r'context(?:\s+window|\s+length|\s+size)?(?:\s+of)?\s+(\d[,\d]*)\s+tokens',
+                r'(\d[,\d]*)\s+token\s+context',
+                r'context\s+window:\s*(\d[,\d]*)'
+            ]
+            
+            for pattern in context_patterns:
+                match = re.search(pattern, readme, re.IGNORECASE)
+                if match:
+                    return match.group(1).replace(',', '')
+                    
+        return None
+    
+    def scrape_model_tags(self, model_info, use_cache=True):
         """Scrape all available tags for a specific model."""
         model_name = model_info['name']
         tags_url = f"{self.base_url}/library/{model_name}/tags"
-        cache_file = os.path.join(self.cache_dir, f"tags_{model_name}.html")
         
-        # Check if cache exists and is recent enough
-        if use_cache and os.path.exists(cache_file):
-            cache_age = time.time() - os.path.getmtime(cache_file)
-            if cache_age < cache_expiry:
-                #print(f"Using cached tags for {model_name} (age: {int(cache_age)}s)")
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    html = f.read()
-            else:
-                #print(f"Cache expired for {model_name} tags, fetching fresh data...")
-                html = self._fetch_page(tags_url)
-                with open(cache_file, 'w', encoding='utf-8') as f:
-                    f.write(html)
-        else:
-            #print(f"Fetching tags for {model_name}...")
-            html = self._fetch_page(tags_url)
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                f.write(html)
-                
-        # Parse the HTML to extract tags
+        html = self._get_cached_or_fetch(
+            tags_url,
+            f"tags_{model_name}.html",
+            use_cache
+        )
+        
+        # Parse HTML to extract tags
         soup = BeautifulSoup(html, 'html.parser')
         tag_links = soup.select('a.group')
         
@@ -232,81 +231,56 @@ class OllamaLibraryScraper:
             updated_info = size_info.find_next('span', class_='text-neutral-500') if size_info else None
             updated_text = updated_info.text.strip() if updated_info else "Unknown"
             
-            # Extract quantization information from tag name
-            quantization = None
-            quant_patterns = {
-                'q2': '2-bit',
-                'q3': '3-bit',
-                'q4': '4-bit', 
-                'q5': '5-bit',
-                'q6': '6-bit',
-                'q8': '8-bit'
-            }
+            # Determine quantization type from tag name
+            quantization = self._determine_quantization(tag_name)
             
-            for pattern, quant_type in quant_patterns.items():
-                if pattern in tag_name.lower():
-                    quantization = quant_type
-                    break
-                    
-            if not quantization and 'int4' in tag_name.lower():
-                quantization = '4-bit'
-            elif not quantization and 'int8' in tag_name.lower():
-                quantization = '8-bit'
-            elif not quantization and 'fp16' in tag_name.lower():
-                quantization = '16-bit'
-            elif not quantization:
-                quantization = '16-bit'  # Default assumption
-            
-            # Extract parameters from tag name
-            parameters = self._extract_parameters_from_tag(tag_name, model_info['parameter_count'])
-            
+            # Add tag info
             tags.append({
                 'name': tag_name,
                 'size': size_text,
                 'size_bytes': size_bytes,
                 'updated': updated_text,
                 'quantization': quantization,
-                'parameters': parameters
+                'parameters': self._extract_parameters_from_tag(tag_name, model_info['parameter_count'])
             })
         
-        # Calculate estimated memory requirements
+        # Calculate estimated memory requirements for each tag
         for tag in tags:
-            param_count = self._parse_parameter_count(tag['parameters'])
-            quant_bits = self._get_quantization_bits(tag['quantization'])
-            
-            if param_count and quant_bits:
-                # Base memory in GB (parameters * bits per parameter / 8 bits per byte / 1024^3)
-                base_memory_gb = (param_count * quant_bits / 8) / (1024**3)
-                
-                # Add overhead for KV cache and other runtime requirements
-                ram_required = round(base_memory_gb * 1.3, 1)  # 30% overhead
-                vram_required = round(base_memory_gb * 1.2, 1)  # 20% overhead
-                
-                # Ensure minimum reasonable values
-                ram_required = max(1.0, ram_required)
-                vram_required = max(1.0, vram_required)
-                
-                tag['estimated_requirements'] = {
-                    'ram_gb': ram_required,
-                    'vram_gb': vram_required
-                }
-            else:
-                tag['estimated_requirements'] = {
-                    'ram_gb': None,
-                    'vram_gb': None
-                }
+            self._calculate_memory_requirements(tag)
                 
         # Update model_info with tags
         model_info['tags'] = tags
-        
         return tags
+
+    def _determine_quantization(self, tag_name):
+        """Determine quantization from tag name."""
+        quant_patterns = {
+            'q2': '2-bit',
+            'q3': '3-bit',
+            'q4': '4-bit', 
+            'q5': '5-bit',
+            'q6': '6-bit',
+            'q8': '8-bit'
+        }
+        
+        for pattern, quant_type in quant_patterns.items():
+            if pattern in tag_name.lower():
+                return quant_type
+                
+        if 'int4' in tag_name.lower():
+            return '4-bit'
+        elif 'int8' in tag_name.lower():
+            return '8-bit'
+        elif 'fp16' in tag_name.lower():
+            return '16-bit'
+        
+        return '16-bit'  # Default assumption
     
     def _extract_parameters_from_tag(self, tag_name, default_parameters=None):
-        """Extract parameter count from tag name if possible."""
-        # Look for patterns like 7b, 13b, etc. in the tag name
+        """Extract parameter count from tag name."""
         param_patterns = [
-            r'[-:_](\d+[.,]?\d*)b',  # matches patterns like -7b, :13b, _70b, -1.1b
-            r'(\d+[.,]?\d*)b\b'       # matches patterns like 7b, 13b at word boundary
+            r'[-:_](\d+[.,]?\d*)b',
+            r'(\d+[.,]?\d*)b\b'
         ]
         
         for pattern in param_patterns:
@@ -316,75 +290,37 @@ class OllamaLibraryScraper:
                 
         return default_parameters or "Unknown"
     
-    def _extract_readme(self, soup):
-        """Extract README content from model page."""
-        # Look for the README section
-        readme_header = soup.find('h2', string='Readme')
-        if not readme_header:
-            return ""
+    def _calculate_memory_requirements(self, tag):
+        """Calculate estimated memory requirements for a tag."""
+        param_count = self._parse_parameter_count(tag['parameters'])
+        quant_bits = self._get_quantization_bits(tag['quantization'])
+        
+        if param_count and quant_bits:
+            # Base memory in GB (parameters * bits per parameter / 8 bits per byte / 1024^3)
+            base_memory_gb = (param_count * quant_bits / 8) / (1024**3)
             
-        # Find the textarea containing the README
-        textarea = readme_header.find_next('textarea')
-        if textarea:
-            return textarea.text.strip()
+            # Add overhead for KV cache and other runtime requirements
+            ram_required = max(1.0, round(base_memory_gb * 1.3, 1))  # 30% overhead
+            vram_required = max(1.0, round(base_memory_gb * 1.2, 1))  # 20% overhead
             
-        return ""
-    
-    def _extract_parameter_count(self, soup, readme):
-        """Extract parameter count from model page or README."""
-        # First try to find it in the model specs on the page
-        param_elem = soup.select_one('dt:-soup-contains("Parameters") + dd')
-        if param_elem:
-            return param_elem.text.strip()
-            
-        # Otherwise, try to find it in the README
-        if readme:
-            param_patterns = [
-                r'(\d+(?:\.\d+)?)\s*[Bb]illion parameters',
-                r'(\d+(?:\.\d+)?)\s*[Bb] parameters',
-                r'(\d+(?:\.\d+)?)[Bb] parameter',
-                r'parameters:\s*(\d+(?:\.\d+)?)\s*[Bb]'
-            ]
-            
-            for pattern in param_patterns:
-                match = re.search(pattern, readme)
-                if match:
-                    return f"{match.group(1)}B"
-                    
-        return None
-    
-    def _extract_context_window(self, soup, readme):
-        """Extract context window size from model page or README."""
-        # First try to find it in the model specs on the page
-        context_elem = soup.select_one('dt:-soup-contains("Context") + dd')
-        if context_elem:
-            return context_elem.text.strip()
-            
-        # Otherwise, try to find it in the README
-        if readme:
-            context_patterns = [
-                r'context(?:\s+window|\s+length|\s+size)?(?:\s+of)?\s+(\d[,\d]*)\s+tokens',
-                r'(\d[,\d]*)\s+token\s+context',
-                r'context\s+window:\s*(\d[,\d]*)'
-            ]
-            
-            for pattern in context_patterns:
-                match = re.search(pattern, readme, re.IGNORECASE)
-                if match:
-                    # Remove commas from the number
-                    return match.group(1).replace(',', '')
-                    
-        return None
+            tag['estimated_requirements'] = {
+                'ram_gb': ram_required,
+                'vram_gb': vram_required
+            }
+        else:
+            tag['estimated_requirements'] = {
+                'ram_gb': None,
+                'vram_gb': None
+            }
     
     def _parse_parameter_count(self, param_string):
         """Convert parameter string to actual number."""
         if not param_string or param_string == "Unknown":
             return None
             
-        # Extract the number from strings like "7B", "13.5B"
         match = re.search(r'(\d+(?:\.\d+)?)', param_string)
         if match:
-            return float(match.group(1)) * 1_000_000_000  # Convert billions to actual count
+            return float(match.group(1)) * 1_000_000_000  # Convert to actual count
             
         return None
     
@@ -393,37 +329,14 @@ class OllamaLibraryScraper:
         if not quant_string:
             return None
             
-        # Extract the number from strings like "4-bit", "8-bit"
         match = re.search(r'(\d+)-bit', quant_string)
         if match:
             return int(match.group(1))
             
         return None
     
-    def _fetch_page(self, url):
-        """Fetch HTML content from a URL with error handling."""
-        try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            return response.text
-        except requests.RequestException as e:
-            print(f"Error fetching {url}: {e}")
-            sys.exit(1)
-    
     def estimate_compatibility(self, system_specs, model_info):
-        """
-        Estimate if a model is compatible with the given system specs.
-        
-        Args:
-            system_specs: Dictionary with system specifications
-            model_info: Model information including tags
-            
-        Returns:
-            Dictionary mapping tag names to compatibility results
-        """
+        """Estimate if a model is compatible with the given system specs."""
         results = {}
         
         # Extract system specs
@@ -441,49 +354,33 @@ class OllamaLibraryScraper:
             vram_required = reqs.get('vram_gb')
             
             if not ram_required:
-                results[tag_name] = {
-                    'compatible': False,
-                    'reason': "Unknown requirements"
-                }
+                results[tag_name] = {'compatible': False, 'reason': "Unknown requirements"}
                 continue
                 
-            # For GPU systems, check both RAM and VRAM
+            # GPU system check
             if has_gpu and gpu_vram is not None:
                 if total_ram >= ram_required and gpu_vram >= vram_required:
-                    results[tag_name] = {
-                        'compatible': True,
-                        'reason': "Meets both RAM and VRAM requirements"
-                    }
+                    results[tag_name] = {'compatible': True, 'reason': "Meets RAM and VRAM requirements"}
                 elif gpu_vram < vram_required:
-                    results[tag_name] = {
-                        'compatible': False,
-                        'reason': f"Not enough VRAM (need {vram_required}GB)"
-                    }
+                    results[tag_name] = {'compatible': False, 'reason': f"Not enough VRAM (need {vram_required}GB)"}
                 else:
-                    results[tag_name] = {
-                        'compatible': False,
-                        'reason': f"Not enough RAM (need {ram_required}GB)"
-                    }
+                    results[tag_name] = {'compatible': False, 'reason': f"Not enough RAM (need {ram_required}GB)"}
             
-            # For Apple Silicon (shared memory)
+            # Apple Silicon (shared memory)
             elif has_gpu and system_specs.get('gpu', {}).get('vram') == "Shared with system":
                 if total_ram >= max(ram_required, vram_required):
-                    results[tag_name] = {
-                        'compatible': True,
-                        'reason': "Meets shared memory requirements"
-                    }
+                    results[tag_name] = {'compatible': True, 'reason': "Meets shared memory requirements"}
                 else:
                     results[tag_name] = {
-                        'compatible': False,
+                        'compatible': False, 
                         'reason': f"Not enough shared memory (need {max(ram_required, vram_required)}GB)"
                     }
             
-            # For CPU-only systems
+            # CPU-only systems
             else:
-                # CPU-only inference needs more RAM
                 cpu_ram_required = ram_required * 1.2  # 20% more for CPU inference
                 
-                # Special case for small quantized models
+                # Check for small quantized models
                 model_size_match = re.search(r'(\d+(?:\.\d+)?)', tag.get('parameters', '7B'))
                 model_size = float(model_size_match.group(1)) if model_size_match else 7
                 
@@ -491,18 +388,12 @@ class OllamaLibraryScraper:
                 is_medium_quantized = model_size <= 7 and tag.get('quantization', '') in ["2-bit", "3-bit", "4-bit"]
                 
                 if is_small_quantized and total_ram >= 4.0:
-                    results[tag_name] = {
-                        'compatible': True,
-                        'reason': "Small quantized model runs with 4GB+ RAM"
-                    }
+                    results[tag_name] = {'compatible': True, 'reason': "Small quantized model runs with 4GB+ RAM"}
                 elif is_medium_quantized and total_ram >= 6.0:
-                    results[tag_name] = {
-                        'compatible': True,
-                        'reason': "Medium quantized model runs with 6GB+ RAM"
-                    }
+                    results[tag_name] = {'compatible': True, 'reason': "Medium quantized model runs with 6GB+ RAM"}
                 elif total_ram >= cpu_ram_required:
                     results[tag_name] = {
-                        'compatible': True,
+                        'compatible': True, 
                         'reason': f"Meets CPU-only RAM requirement of {cpu_ram_required:.1f}GB"
                     }
                 else:
@@ -520,78 +411,55 @@ class OllamaLibraryScraper:
         print(f"Saved data to {filename}")
 
     def search_models(self, query):
-        """
-        Search for models using Ollama's search functionality
-        
-        Args:
-                query: Search term (e.g., 'code', 'llama', etc.)
-        """
+        """Search for models using Ollama's search functionality."""
         search_url = f"https://ollama.com/search?q={query}"
         print(f"Searching for models matching '{query}'...")
         
         html = self._fetch_page(search_url)
-        
-        # Parse the HTML to extract model cards
         soup = BeautifulSoup(html, 'html.parser')
         
-        # First try the original selector
-        model_cards = soup.select('a[href^="/library/"]')
-        print(f"Found {len(model_cards)} model cards with first selector")
-        
-        # Try a more comprehensive selector that might catch additional models
+        # Get model links
+        model_cards = []
         all_links = soup.find_all('a')
-        library_links = [link for link in all_links if link.get('href') and link['href'].startswith('/library/')]
-        print(f"Found {len(library_links)} model cards with broader selector")
+        for link in all_links:
+            href = link.get('href', '')
+            if href.startswith('/library/') and '/tags' not in href:
+                model_cards.append(link)
         
-        # Use whichever found more
-        if len(library_links) > len(model_cards):
-                model_cards = library_links
-        
-        # Let's check for duplicate models
-        model_urls = set()
+        # Remove duplicates
+        seen_urls = set()
         unique_cards = []
-        
         for card in model_cards:
-                url = card['href']
-                if url not in model_urls and not "/tags" in url:
-                        model_urls.add(url)
+            url = card['href']
+            if url not in seen_urls:
+                seen_urls.add(url)
                 unique_cards.append(card)
         
-        print(f"Found {len(unique_cards)} unique model cards")
-        
-        # Process each unique model card
+        # Process each model card
         models = []
         for card in unique_cards:
-                # Skip tags pages
-                if "/tags" in card['href']:
-                        continue
+            model_name = card['href'].split('/')[-1]
+            if not model_name or len(model_name) < 2:
+                continue
                 
-                # Get model name from URL
-                model_name = card['href'].split('/')[-1]
-                
-                # Skip if this is not a model card
-                if not model_name or len(model_name) < 2:
-                        continue
-                
-                # Extract basic information from the card
-                model_info = {
+            model_info = {
                 'name': model_name,
                 'url': f"{self.base_url}{card['href']}",
-                'description': self._extract_description(card),
-                'pull_count': self._extract_pull_count(card),
-                'last_updated': self._extract_last_updated(card),
-                'capabilities': self._extract_capabilities(card),
-                'size': self._extract_size(card)
-                }
-                
-                models.append(model_info)
+                'description': self._extract_text(card, 'p.max-w-lg'),
+                'pull_count': self._extract_text(card, 'span[x-test-pull-count]'),
+                'last_updated': self._extract_text(card, 'span[x-test-updated]'),
+                'capabilities': [elem.text.strip() for elem in card.select('span[x-test-capability]')],
+                'size': self._extract_text(card, 'span[x-test-size]')
+            }
+            
+            models.append(model_info)
         
-        print(f"Found {len(models)} valid models matching '{query}'")
+        print(f"Found {len(models)} models matching '{query}'")
         return models
 
 
 def get_system_specs():
-    """Get basic system specifications"""
+    """Get basic system specifications."""
     # Get CPU info
     cpu_cores = psutil.cpu_count(logical=False)
     cpu_threads = psutil.cpu_count(logical=True)
@@ -630,7 +498,6 @@ def get_system_specs():
     
     # Try NVIDIA GPU
     try:
-        import subprocess
         nvidia_output = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]).decode()
         if nvidia_output.strip():
             has_gpu = True
@@ -660,12 +527,10 @@ def get_system_specs():
 
 def main():
     """Main function."""
-    import platform
-    import subprocess
     import argparse
     
     parser = argparse.ArgumentParser(description="Scrape Ollama model library and check compatibility")
-    parser.add_argument("--max-models", type=int, default=None, help="Maximum number of models to scrape (for testing)")
+    parser.add_argument("--max-models", type=int, default=None, help="Maximum number of models to scrape")
     parser.add_argument("--output", type=str, default="ollama_models.json", help="Output JSON file")
     parser.add_argument("--search", type=str, help="Search for models matching a specific term")
     args = parser.parse_args()
@@ -677,7 +542,6 @@ def main():
     print("System Information:")
     print(f"CPU: {system['cpu']['name']} ({system['cpu']['cores']} cores, {system['cpu']['threads']} threads)")
     print(f"RAM: {system['ram']}GB")
-    
     if system["has_gpu"]:
         print(f"GPU: {system['gpu']['name']}")
         print(f"VRAM: {system['gpu']['vram']}GB" if system['gpu']['vram'] != "Shared with system" else f"VRAM: {system['gpu']['vram']}")
@@ -688,13 +552,13 @@ def main():
     # Create the scraper
     scraper = OllamaLibraryScraper()
     
-    # Scrape the main library page
+    # Scrape models
     if args.search:
         models = scraper.search_models(args.search)
     else:
         models = scraper.scrape_library()
     
-    # Limit the number of models to scrape if specified
+    # Limit the number of models if specified
     if args.max_models:
         models = models[:args.max_models]
     
@@ -733,7 +597,6 @@ def main():
         for model_name, tags in compatible_models.items():
             print(f"• {model_name}")
             for tag in tags:
-                # Find the tag details
                 model_info = next((m for m in models if m['name'] == model_name), None)
                 if model_info:
                     tag_info = next((t for t in model_info.get('tags', []) if t['name'] == tag), None)
@@ -746,9 +609,6 @@ def main():
                     print(f"  - {tag}")
     else:
         print("\nNo compatible models found for your system.")
-
-
-
 
 if __name__ == "__main__":
     main()
